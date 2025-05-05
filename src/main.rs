@@ -19,7 +19,7 @@ struct Slave {
     write: HANDLE,
 }
 
-// we gotta do this, so it is safe between threads
+// we gotta do this, so it is safe between threads (apparently)
 unsafe impl Send for Master {}
 
 impl Drop for PtyPair {
@@ -56,50 +56,51 @@ impl PtyPair {
         
     }
 
+    // Everytime it is ran (in the future) I need to return JSONValue (from serde)
     fn read_master_stdout(master: Master) { 
         let buf_size = 8192; // More reasonable buffer size
-    let mut buffer = vec![0; buf_size];
-    
-    loop {
-        let mut bytes_read = 0;
+        let mut buffer = vec![0; buf_size];
         
-        let success_read = unsafe { 
-            ReadFile(
-                master.read,
-                buffer.as_mut_ptr() as *mut _,
-                buffer.len() as u32,
-                &mut bytes_read,
-                null_mut()
-            ) 
-        };
+        loop {
+            let mut bytes_read = 0;
+            
+            let success_read = unsafe { 
+                ReadFile(
+                    master.read,
+                    buffer.as_mut_ptr() as *mut _,
+                    buffer.len() as u32,
+                    &mut bytes_read,
+                    null_mut()
+                ) 
+            };
 
-        if success_read == 0 {
-            let err = io::Error::last_os_error();
-            eprintln!("Failed to read output: {}", err);
-            // Check if pipe is broken or closed
-            if err.kind() == io::ErrorKind::BrokenPipe {
+            if success_read == 0 {
+                let err = io::Error::last_os_error();
+                eprintln!("Failed to read output: {}", err);
+                // Check if pipe is broken or closed
+                if err.kind() == io::ErrorKind::BrokenPipe {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
+            
+            // If we read 0 bytes, the pipe might be closed
+            if bytes_read == 0 {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            continue;
-        }
-        
-        // If we read 0 bytes, the pipe might be closed
-        if bytes_read == 0 {
-            break;
-        }
-        
-        // Convert the read bytes to a string and print it
-        if let Ok(str) = String::from_utf8(buffer[..bytes_read as usize].to_vec()) {
-            print!("{}", str); // Using print! instead of println! to respect line endings
-            io::stdout().flush().unwrap(); // Make sure output appears immediately
-        } else {
-            // Handle non-UTF8 output if needed
-            print!("{}", String::from_utf8_lossy(&buffer[..bytes_read as usize]));
-            io::stdout().flush().unwrap();
+            
+            // Convert the read bytes to a string and print it
+            if let Ok(str) = String::from_utf8(buffer[..bytes_read as usize].to_vec()) {
+                print!("{}", str); // Using print! instead of println! to respect line endings
+                io::stdout().flush().unwrap(); // Make sure output appears immediately
+            } else {
+                // Handle non-UTF8 output if needed
+                print!("{}", String::from_utf8_lossy(&buffer[..bytes_read as usize]));
+                io::stdout().flush().unwrap();
+            }
         }
     }
-        }
 
     fn master_stdin(master: Master, slave: Slave, data: &str) {
         let mut bytes_written = 0;
@@ -113,26 +114,6 @@ impl PtyPair {
 
         if success == 0 {
            exit(0)
-        } else {
-            Self::slave_stdin(slave, data);
-        }
-    }
-
-    fn slave_stdin(slave: Slave, data: &str){
-        let mut bytes_written = 0;
-        let cmd = format!("{}", data);
-        let success = unsafe { WriteFile(
-            slave.write,
-            cmd.as_ptr() as *const _,
-            cmd.len() as u32,
-            &mut bytes_written,
-            null_mut(),
-        ) };
-
-        if success == 0 {
-            exit(0)
-        } else {
-            
         }
     }
 
@@ -231,14 +212,36 @@ impl PtyPair {
             // Create stdin pipe (parent writes, child reads)
             let mut stdin_read = null_mut();
             let mut stdin_write = null_mut();
-            CreatePipe(&mut stdin_read, &mut stdin_write, &mut sa, 0);
-            SetHandleInformation(stdin_write, HANDLE_FLAG_INHERIT, 0); // parent handle not inheritable
+
+            if CreatePipe(&mut stdin_read, &mut stdin_write, &mut sa, 0) == 0 {
+                // better error needed probably
+                exit(0);
+            };
+
+           if SetHandleInformation(stdin_write, HANDLE_FLAG_INHERIT, 0) == 0 {
+                // better error needed probably
+                CloseHandle(stdin_read);
+                CloseHandle(stdin_write);
+                exit(0);
+           }; 
 
             // Create stdout pipe (child writes, parent reads)
             let mut stdout_read = null_mut();
             let mut stdout_write = null_mut();
-            CreatePipe(&mut stdout_read, &mut stdout_write, &mut sa, 0);
-            SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0);
+
+
+           if CreatePipe(&mut stdout_read, &mut stdout_write, &mut sa, 0) == 0 {
+             // better error needed probably
+                exit(0);
+           };
+            if SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0) == 0 {
+                 // better error needed probably
+                 CloseHandle(stdin_read);
+                 CloseHandle(stdin_write);
+                 CloseHandle(stdout_read);
+                 CloseHandle(stdout_write);
+                 exit(0);
+            };
     
     
             return Ok(PtyPair {
