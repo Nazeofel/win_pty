@@ -131,6 +131,7 @@ impl PtyPair {
 
     fn create_pseudo_console() ->  io::Result<(PtyPair, Master)> {
 
+        // maybe make whole function body unsafe so I dont have to declare it more than once
         let mut stdin_read = HANDLE(null_mut());
         let mut stdin_write = HANDLE(null_mut());
         let mut stdout_read = HANDLE(null_mut());
@@ -187,6 +188,7 @@ impl PtyPair {
             }
         }
 
+        // we are not spawning a console but it is still needed 
         let size = COORD { X: 80, Y: 80 };
         let hpc: HPCON = unsafe { CreatePseudoConsole(size, stdin_read, stdout_write, 0)? };
 
