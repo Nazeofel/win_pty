@@ -1,6 +1,6 @@
 use std::{ffi::c_void, io::{self, Write}, ptr::null_mut, str, sync::{Arc, Mutex}, thread};
 use simple_logger::SimpleLogger;
-use log::{info, warn, error, debug, trace};
+use log::{info, error, debug};
 
 use windows::{
     core::*,
@@ -30,28 +30,29 @@ struct Slave {
 // we gotta do this, so it is safe between threads (apparently)
 unsafe impl Send for Master {}
 unsafe impl Sync for Master {}
-// impl Drop for PtyPair {
-//     fn drop(&mut self) {
-//         unsafe {
-//             ClosePseudoConsole(self.hpc);
-//             CloseHandle(self.process_info.hProcess);
-//             CloseHandle(self.process_info.hThread);
-//             // Close all pipe handles
-//             if !self.master.read.0.is_null() {
-//                 CloseHandle(self.master.read);
-//             }
-//             if !self.master.write.0.is_null() {
-//                 CloseHandle(self.master.write);
-//             }
-//             if !self.slave.read.0.is_null() {
-//                 CloseHandle(self.slave.read);
-//             }
-//             if !self.slave.write.0.is_null() {
-//                 CloseHandle(self.slave.write);
-//             }
-//         }
-//     }
-// }
+
+impl Drop for PtyPair {
+    fn drop(&mut self) {
+        unsafe {
+            ClosePseudoConsole(self.hpc);
+            let _ = CloseHandle(self.process_info.hProcess);
+            let _ = CloseHandle(self.process_info.hThread);
+            // Close all pipe handles
+            if !self.master.read.lock().unwrap().0.is_null() {
+                let _ = CloseHandle(self.master.read.lock().unwrap().clone());
+            }
+            if !self.master.write.lock().unwrap().0.is_null() {
+                let _ = CloseHandle(self.master.write.lock().unwrap().clone());
+            }
+            if !self.slave.read.0.is_null() {
+                let _ = CloseHandle(self.slave.read);
+            }
+            if !self.slave.write.0.is_null() {
+                let _ = CloseHandle(self.slave.write);
+            }
+        }
+    }
+}
 
 impl PtyPair {
     fn new() -> Self {
@@ -96,7 +97,7 @@ impl PtyPair {
 
     fn read_master_stdout(master: Master){
         
-        let buf_size = 1024;
+        let buf_size = 100000000;
         let mut buffer = vec![0u8; buf_size];
         loop {
            // println!("Reading from master stdout...");
@@ -171,9 +172,9 @@ impl PtyPair {
         
         match success {
             Ok(_) => {
+
                 info!("data correctly written: {:?} bytes written: {}", str::from_utf8(bytes).unwrap(), bytes_written);
 
-                //Self::read_master_stdout(master.clone());
             }
             Err(e) => {
                 error!("Failed to write to stdin: {:?}", e);
@@ -185,47 +186,7 @@ impl PtyPair {
     fn create_pseudo_console() ->  io::Result<PtyPair> {
 
         // maybe make whole function body unsafe so I dont have to declare it more than once
-        let mut stdin_read = HANDLE(null_mut());
-        let mut stdin_write = HANDLE(null_mut());
-        let mut stdout_read = HANDLE(null_mut());
-        let mut stdout_write = HANDLE(null_mut());
-
-        let sa = SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>()  as u32,
-            lpSecurityDescriptor: null_mut(),
-            bInheritHandle: TRUE 
-        };
-
-        let handle_one = unsafe { CreatePipe(&mut stdin_read, &mut stdin_write, Some(&sa), 0) };
-        let handle_two = unsafe { CreatePipe(&mut stdout_read, &mut stdout_write, Some(&sa), 0) };
-
-        info!("stdin_read: {:?}", stdin_read);
-        info!("stdin_write: {:?}", stdin_write);
-        info!("stdout_read: {:?}", stdout_read);
-        info!("stdout_write: {:?}", stdout_write);
-
-        unsafe {
-            let _ = SetHandleInformation(stdin_write, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0));
-            let _ = SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0));
-        }
-
-        match handle_one {
-            Ok(_) => info!("handle one created successfully."),
-            Err(e) => {
-                error!("Failed to create handle : {:?}", e);
-                // You can get the error code too
-                error!("HRESULT: {:?}", e.code());
-            }
-        }
-
-        match handle_two {
-            Ok(_) => info!("handle two created successfully."),
-            Err(e) => {
-                error!("Failed to create handle : {:?}", e);
-                // You can get the error code too
-                error!("HRESULT: {:?}", e.code());
-            }
-        }
+        let (stdin_read, stdout_write,stdout_read, stdin_write) = Self::create_pipe_handles();
         // we are not spawning a console but it is still needed  (the size)
         const DEFAULT_CONSOLE_SIZE: COORD = COORD { X: 80, Y: 80 }; 
         let hpc: HPCON = unsafe { CreatePseudoConsole(DEFAULT_CONSOLE_SIZE, stdin_read, stdout_write, 0)? };
@@ -239,59 +200,68 @@ impl PtyPair {
         // we have to do this twice, to find out the size we need (apparently)
 
         // also THIS IS BOUND TO fail (apparently also)
-        let _ =  unsafe { InitializeProcThreadAttributeList(
+        let attr_list_mem: LPPROC_THREAD_ATTRIBUTE_LIST;
+        let _ =  unsafe { 
+            let _ = InitializeProcThreadAttributeList(
                     None,          
                     1,
                     None,             
                     &mut attr_list_size as *mut usize,
-                )
-        };
+                );
 
-        let ptr = unsafe { HeapAlloc(GetProcessHeap().unwrap(), windows::Win32::System::Memory::HEAP_FLAGS(0), attr_list_size) };
+            let ptr = HeapAlloc(GetProcessHeap().unwrap(), windows::Win32::System::Memory::HEAP_FLAGS(0), attr_list_size);
 
-        let attr_list_mem: LPPROC_THREAD_ATTRIBUTE_LIST = windows::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST(ptr.cast());
+            attr_list_mem = windows::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST(ptr.cast());
+
+            let init_proc =
+                InitializeProcThreadAttributeList(  
+                    Some(attr_list_mem),
+                    1,
+                    Some(0),
+                    &mut attr_list_size as *mut usize,
+                );
+
+            match init_proc {
+                Ok(_) => info!("Attribute list initialized successfully."),
+                Err(e) => {
+                    error!("Failed to initialize attribute list: {:?}", e);
+                    // You can get the error code too
+                    error!("HRESULT: {:?}", e.code());
+                }
+            }
+
+            let update_proc_attr = UpdateProcThreadAttribute(
+                attr_list_mem,
+                0,
+                PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
+                Some(&hpc  as *const _ as *const c_void),
+                size_of::<HPCON>(),
+                None,
+                None,
+            );
+
+
+            match update_proc_attr {
+                Ok(_) => info!("Pseudoconsole handle added to attribute list."),
+                Err(e) => {
+                    error!("Failed to initialize attribute list: {:?}", e);
+                    return Err(io::Error::new(io::ErrorKind::Other, "Failed to update attribute list"));
+
+                }
+            };
         
-        let init_proc =    unsafe {
-            InitializeProcThreadAttributeList(  
-                Some(attr_list_mem),
-                1,
-                Some(0),
-                &mut attr_list_size as *mut usize,
-            )
         };
 
-        match init_proc {
-            Ok(_) => info!("Attribute list initialized successfully."),
-            Err(e) => {
-                error!("Failed to initialize attribute list: {:?}", e);
-                // You can get the error code too
-                error!("HRESULT: {:?}", e.code());
-            }
-        }
 
-        let update_proc_attr = unsafe { UpdateProcThreadAttribute(
-            attr_list_mem,
-            0,
-            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-            Some(&hpc.0  as *const _ as *const c_void),
-            size_of::<HPCON>(),
-            None,
-            None,
-        ) };
-
-        match update_proc_attr {
-            Ok(_) => info!("Update proc attribute."),
-            Err(e) => {
-                error!("Failed to initialize attribute list: {:?}", e);
-                error!("HRESULT: {:?}", e.code());
-            }
-        }
-
-
+        
+        
         let master = Master { read: Arc::new(Mutex::new(stdout_read)), write: Arc::new(Mutex::new(stdin_write)) };
         let slave = Slave { read: stdin_read, write: stdout_write };
-
         let process_info  = Self::start_process(master.clone(), attr_list_mem);
+
+         unsafe {
+            let _ = CloseHandle(stdout_write); 
+        }
 
         let pair = PtyPair { master: master.clone(), slave: slave.clone(), hpc, process_info };
         Ok(pair)
@@ -299,14 +269,14 @@ impl PtyPair {
     }
 
     fn start_process(master: Master, list: LPPROC_THREAD_ATTRIBUTE_LIST) -> PROCESS_INFORMATION {
-        let mut cmdline: Vec<u16> = "cmd.exe\0".encode_utf16().collect();
+        let mut cmdline: Vec<u16> = "cmd.exe /Q /K prompt $G\0".encode_utf16().collect();
 
         let mut si_ex = STARTUPINFOEXW::default();        
         let mut process_info: PROCESS_INFORMATION = PROCESS_INFORMATION::default();
 
         si_ex.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
         si_ex.lpAttributeList = list;
-
+        debug!("Attribute list pointer: {:?}", si_ex.lpAttributeList);
 
         let master_for_thread = master.clone();
 
@@ -319,6 +289,21 @@ impl PtyPair {
             }
         });
 
+    
+        // WE NEED TO MAKE THIS WORK IF WE WANT ENVS to be passed.
+
+        //     use std::os::windows::ffi::OsStrExt;
+        //     let env: Vec<u16> = std::env::vars_os()
+        // .flat_map(|(k, v)| {
+        //     let mut pair = k.encode_wide().collect::<Vec<_>>(); // Use encode_wide here
+        //     pair.push('=' as u16);
+        //     pair.extend(v.encode_wide()); // Use encode_wide here
+        //     pair.push(0);
+        //     pair
+        // }).chain(std::iter::once(0))
+        // .collect();
+        //     let env_ptr = if env.is_empty() { None } else { Some(env.as_ptr() as *const c_void) };
+
         let success = unsafe {
             CreateProcessW(
                 PCWSTR::null(),
@@ -326,13 +311,21 @@ impl PtyPair {
                 None,
                 None,
                 TRUE.as_bool(),
-                EXTENDED_STARTUPINFO_PRESENT,
+                windows::Win32::System::Threading::PROCESS_CREATION_FLAGS(0),
                 None,
                 None,
                 &si_ex.StartupInfo as *const _,
                 &mut process_info,
             )
         };
+
+
+        unsafe {
+            WaitForSingleObject(process_info.hProcess, INFINITE);
+            let mut exit_code = 0;
+            let _ = GetExitCodeProcess(process_info.hProcess, &mut exit_code);
+            debug!("Child process exit code: {}", exit_code);
+    }
 
         match success {
             Ok(_) => info!("Process created successfully."),
@@ -353,7 +346,18 @@ impl PtyPair {
 
 
     }
+    
+    fn resize_pseudo_console(self: Self, size: COORD) {
+        let result = unsafe { ResizePseudoConsole(self.hpc, size) };
+        if result.is_ok() {
+            info!("Pseudo console resized successfully.");
+        } else {
+            error!("Failed to resize pseudo console: {:?}", result);
+        }
+    }
 
+    // unused by useful for debugging
+    #[allow(dead_code)]
     fn check_handle_flags(handle: HANDLE) {
         let mut flags = 0;
         let result = unsafe { GetHandleInformation(handle, &mut flags) };
@@ -364,8 +368,54 @@ impl PtyPair {
         }
     }
 
+    fn create_pipe_handles() -> (HANDLE, HANDLE, HANDLE, HANDLE) {
+        let mut stdin_read = HANDLE(null_mut());
+        let mut stdin_write = HANDLE(null_mut());
+        let mut stdout_read = HANDLE(null_mut());
+        let mut stdout_write = HANDLE(null_mut());
+
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>()  as u32,
+            lpSecurityDescriptor: null_mut(),
+            bInheritHandle: TRUE 
+        };
+
+        let stdin_pipe = unsafe { CreatePipe(&mut stdin_read, &mut stdin_write, Some(&sa), 0) };
+        let stdout_pipe = unsafe { CreatePipe(&mut stdout_read, &mut stdout_write, Some(&sa), 0) };
+
+        info!("stdin_read: {:?}", stdin_read);
+        info!("stdin_write: {:?}", stdin_write);
+        info!("stdout_read: {:?}", stdout_read);
+        info!("stdout_write: {:?}", stdout_write);
+
+        unsafe {
+            let _ = SetHandleInformation(stdin_write, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0));
+            let _ = SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0));
+        }
+
+        match stdin_pipe {
+            Ok(_) => info!("handle one created successfully."),
+            Err(e) => {
+                error!("Failed to create handle : {:?}", e);
+                // You can get the error code too
+                error!("HRESULT: {:?}", e.code());
+            }
+        }
+
+        match stdout_pipe {
+            Ok(_) => info!("handle two created successfully."),
+            Err(e) => {
+                error!("Failed to create handle : {:?}", e);
+                // You can get the error code too
+                error!("HRESULT: {:?}", e.code());
+            }
+        }
+
+        (stdin_read, stdout_write, stdout_read, stdin_write)
+    }
+
 }
 
 fn main() {
-     PtyPair::new();
+     let pty  = PtyPair::new();
 }
