@@ -68,6 +68,7 @@ impl PtyPair {
         let stdin = io::stdin();
         let mut input = String::new();
         
+
         loop {
             
             input.clear();
@@ -97,7 +98,7 @@ impl PtyPair {
 
     fn read_master_stdout(master: Master){
         
-        let buf_size = 100000000;
+        let buf_size = 1024;
         let mut buffer = vec![0u8; buf_size];
         loop {
            // println!("Reading from master stdout...");
@@ -150,6 +151,9 @@ impl PtyPair {
     fn master_stdin(master: &Master, data: &str) {
         let mut bytes_written: u32 = 0;
 
+
+        debug!("Writing to master stdin: {:?}", data);
+
         let mut cmd = data.to_string();
         if !cmd.ends_with("\r\n") {
             cmd.push_str("\r\n");
@@ -173,7 +177,7 @@ impl PtyPair {
         match success {
             Ok(_) => {
 
-                info!("data correctly written: {:?} bytes written: {}", str::from_utf8(bytes).unwrap(), bytes_written);
+                debug!("data correctly written: {:?} bytes written: {}", str::from_utf8(bytes).unwrap(), bytes_written);
 
             }
             Err(e) => {
@@ -269,7 +273,7 @@ impl PtyPair {
     }
 
     fn start_process(master: Master, list: LPPROC_THREAD_ATTRIBUTE_LIST) -> PROCESS_INFORMATION {
-        let mut cmdline: Vec<u16> = "cmd.exe /Q /K prompt $G\0".encode_utf16().collect();
+        let mut cmdline: Vec<u16> = "cmd.exe /K echo Hello, World!\0".encode_utf16().collect();
 
         let mut si_ex = STARTUPINFOEXW::default();        
         let mut process_info: PROCESS_INFORMATION = PROCESS_INFORMATION::default();
@@ -292,17 +296,28 @@ impl PtyPair {
     
         // WE NEED TO MAKE THIS WORK IF WE WANT ENVS to be passed.
 
-        //     use std::os::windows::ffi::OsStrExt;
-        //     let env: Vec<u16> = std::env::vars_os()
-        // .flat_map(|(k, v)| {
-        //     let mut pair = k.encode_wide().collect::<Vec<_>>(); // Use encode_wide here
-        //     pair.push('=' as u16);
-        //     pair.extend(v.encode_wide()); // Use encode_wide here
-        //     pair.push(0);
-        //     pair
-        // }).chain(std::iter::once(0))
-        // .collect();
-        //     let env_ptr = if env.is_empty() { None } else { Some(env.as_ptr() as *const c_void) };
+            use std::os::windows::ffi::OsStrExt;
+            let mut env: Vec<u16> = std::env::vars_os()
+        .flat_map(|(k, v)| {
+            let mut pair = k.encode_wide().collect::<Vec<_>>(); // Use encode_wide here
+            pair.push('=' as u16);
+            pair.extend(v.encode_wide()); // Use encode_wide here
+            pair.push(0);
+            pair
+        }).chain(std::iter::once(0))
+        .collect();
+
+
+            if !std::env::vars_os().any(|(k, _)| k == "PATH") {
+                let path = std::env::var_os("PATH").unwrap_or_default();
+                let mut path_pair = "PATH=".encode_utf16().collect::<Vec<_>>();
+                path_pair.extend(path.encode_wide());
+                path_pair.push(0);
+                env.extend(path_pair);
+            }
+env.push(0);
+
+            let env_ptr: Option<*const c_void> = if env.is_empty() { None } else { Some(env.as_ptr() as *const c_void) };
 
         let success = unsafe {
             CreateProcessW(
@@ -310,9 +325,9 @@ impl PtyPair {
                  Some(PWSTR(cmdline.as_mut_ptr())),
                 None,
                 None,
-                TRUE.as_bool(),
-                windows::Win32::System::Threading::PROCESS_CREATION_FLAGS(0),
-                None,
+                FALSE.as_bool(),
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                env_ptr,
                 None,
                 &si_ex.StartupInfo as *const _,
                 &mut process_info,
@@ -325,6 +340,11 @@ impl PtyPair {
             let mut exit_code = 0;
             let _ = GetExitCodeProcess(process_info.hProcess, &mut exit_code);
             debug!("Child process exit code: {}", exit_code);
+
+            if exit_code != 0 {
+                let error_code = GetLastError();
+                error!("Process failed with exit code: {}, Error Code: {:?}", exit_code, error_code);
+            }
     }
 
         match success {
@@ -417,5 +437,5 @@ impl PtyPair {
 }
 
 fn main() {
-     let pty  = PtyPair::new();
+        let pty  = PtyPair::new();
 }
