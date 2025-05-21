@@ -296,28 +296,7 @@ impl PtyPair {
     
         // WE NEED TO MAKE THIS WORK IF WE WANT ENVS to be passed.
 
-            use std::os::windows::ffi::OsStrExt;
-            let mut env: Vec<u16> = std::env::vars_os()
-        .flat_map(|(k, v)| {
-            let mut pair = k.encode_wide().collect::<Vec<_>>(); // Use encode_wide here
-            pair.push('=' as u16);
-            pair.extend(v.encode_wide()); // Use encode_wide here
-            pair.push(0);
-            pair
-        }).chain(std::iter::once(0))
-        .collect();
-
-
-            if !std::env::vars_os().any(|(k, _)| k == "PATH") {
-                let path = std::env::var_os("PATH").unwrap_or_default();
-                let mut path_pair = "PATH=".encode_utf16().collect::<Vec<_>>();
-                path_pair.extend(path.encode_wide());
-                path_pair.push(0);
-                env.extend(path_pair);
-            }
-env.push(0);
-
-            let env_ptr: Option<*const c_void> = if env.is_empty() { None } else { Some(env.as_ptr() as *const c_void) };
+        let env_vars = Self::collect_os_vars();
 
         let success = unsafe {
             CreateProcessW(
@@ -327,7 +306,7 @@ env.push(0);
                 None,
                 FALSE.as_bool(),
                 EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-                env_ptr,
+                env_vars,
                 None,
                 &si_ex.StartupInfo as *const _,
                 &mut process_info,
@@ -377,6 +356,34 @@ env.push(0);
     }
 
     // unused by useful for debugging
+
+    fn collect_os_vars() -> Option<*const c_void> {
+            use std::os::windows::ffi::OsStrExt;
+
+            let mut env: Vec<u16> = std::env::vars_os()
+            .flat_map(|(k, v)| {
+                let mut pair = k.encode_wide().collect::<Vec<_>>(); // Use encode_wide here
+                pair.push('=' as u16);
+                pair.extend(v.encode_wide()); // Use encode_wide here
+                pair.push(0);
+                pair
+            }).chain(std::iter::once(0))
+            .collect();
+
+
+            if !std::env::vars_os().any(|(k, _)| k == "PATH") {
+                let path = std::env::var_os("PATH").unwrap_or_default();
+                let mut path_pair = "PATH=".encode_utf16().collect::<Vec<_>>();
+                path_pair.extend(path.encode_wide());
+                path_pair.push(0);
+                env.extend(path_pair);
+            }
+            env.push(0);
+
+            let env_ptr: Option<*const c_void> = if env.is_empty() { None } else { Some(env.as_ptr() as *const c_void) };
+            env_ptr
+    }
+
     #[allow(dead_code)]
     fn check_handle_flags(handle: HANDLE) {
         let mut flags = 0;
