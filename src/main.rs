@@ -357,18 +357,18 @@ impl PtyPair {
 
     // unused by useful for debugging
 
-    fn collect_os_vars() -> Option<*const c_void> {
-            use std::os::windows::ffi::OsStrExt;
 
+    fn collect_os_vars() -> Option<*const c_void> {
+        use std::os::windows::ffi::OsStrExt;
             let mut env: Vec<u16> = std::env::vars_os()
-            .flat_map(|(k, v)| {
-                let mut pair = k.encode_wide().collect::<Vec<_>>(); // Use encode_wide here
-                pair.push('=' as u16);
-                pair.extend(v.encode_wide()); // Use encode_wide here
-                pair.push(0);
-                pair
-            }).chain(std::iter::once(0))
-            .collect();
+        .flat_map(|(k, v)| {
+            let mut pair = k.encode_wide().collect::<Vec<_>>(); // Use encode_wide here
+            pair.push('=' as u16);
+            pair.extend(v.encode_wide()); // Use encode_wide here
+            pair.push(0);
+            pair
+        }).chain(std::iter::once(0))
+        .collect();
 
 
             if !std::env::vars_os().any(|(k, _)| k == "PATH") {
