@@ -1,3 +1,5 @@
+// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+
 use std::{env, ffi::{c_void, CString}, io::{self, Write}, ptr::null_mut, str, sync::{Arc, Mutex}, thread};
 use simple_logger::SimpleLogger;
 use log::{info, error, debug};
@@ -8,13 +10,19 @@ use windows::{
 };
 
 use windows::Win32::System::Memory::{HeapAlloc, GetProcessHeap};
+use windows::Win32::System::JobObjects::*;
+
+
+use sysinfo::{System};
+use std::collections::HashSet;
 
 #[derive(Clone)]
 struct PtyPair { 
     master: Master,
     slave: Slave,
     hpc: HPCON,
-    process_info: PROCESS_INFORMATION
+    process_info: PROCESS_INFORMATION,
+    h_job: HANDLE,
 }
 #[derive(Clone)]
 struct Master {
@@ -31,6 +39,8 @@ struct Slave {
 unsafe impl Send for Master {}
 unsafe impl Sync for Master {}
 
+unsafe impl Send for PtyPair {}
+unsafe impl Sync for PtyPair {}
 
 // TODO: FIX DROP IMPLEMENTATION.
 
@@ -58,27 +68,22 @@ unsafe impl Sync for Master {}
 // }
 
 
-struct RunningProcess {
-    process_info: PROCESS_INFORMATION,
-    hpc: HPCON,
-}
-
 impl PtyPair {
     fn new() -> Self {
 
-        let log = false;
+        let log = true;
         if log {
             SimpleLogger::new().with_level(Off).init().unwrap();
         } else {
-            SimpleLogger::new().with_level(log::LevelFilter::Info).init().unwrap();
+            SimpleLogger::new().init().unwrap();
         }
 
-            let pair = Self::create_pseudo_console().unwrap();        
-            let master = pair.master.clone();
-            let slave =  pair.slave.clone();
+        let pair = Self::create_pseudo_console().unwrap();
+        let master = pair.master.clone();
+        let slave =  pair.slave.clone();
 
-            PtyPair { master, slave, hpc: pair.hpc, process_info: pair.process_info }
-        }
+        PtyPair { master, slave, hpc: pair.hpc, process_info: pair.process_info, h_job: pair.h_job }
+    }
 
 
     fn read_master_stdout(master: Master){
@@ -116,7 +121,7 @@ impl PtyPair {
                         continue;
                     }
                     let output = String::from_utf8_lossy(&buffer[..bytes_read as usize]);
-                    print!("{}", output);
+                    println!("{}", output);
                     std::io::stdout().flush().unwrap();
                 }
                 Err(e) => {
@@ -131,10 +136,10 @@ impl PtyPair {
 
     // Everytime it is ran (in the future) I need to return JSONValue (from serde)
     fn write(self: &Self, data: &str) {
-        Self::master_stdin(&self.master, data, self.process_info.dwProcessId);
+        Self::master_stdin(self, &self.master, data, self.process_info.dwProcessId);
     }
 
-    fn master_stdin(master: &Master, data: &str, child_pid: u32) {
+    fn master_stdin(self: &Self, master: &Master, data: &str, child_pid: u32) {
         let mut bytes_written: u32 = 0;
 
 
@@ -147,9 +152,32 @@ impl PtyPair {
             cmd.push_str("\r\n");
         }
 
+        // please leave it as IT IS, or change it but be ware, changes are supossed to be reflected on your Front.
         if cmd.starts_with("^C") {
-            unsafe { let _ = GenerateConsoleCtrlEvent(CTRL_C_EVENT, child_pid); };
-            info!("^C sent to child process: {}", child_pid);
+            let subprocess_pid = Self::get_subprocess_pid(self);
+            if subprocess_pid == 0 {
+                error!("Failed to find subprocess in job");
+                return;
+            }
+
+            let process_handle = unsafe {
+                OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION, false, subprocess_pid)
+            };
+
+            if let Ok(handle) = process_handle {
+                let terminate = unsafe { TerminateProcess(handle, 0) };
+
+                if let Err(e) = terminate {
+                    error!("Failed to terminate process: {:?}", e);
+                    return;
+                }
+
+                return;
+            } else {
+                error!("Failed to open process");
+                return;
+            }
+
         }
 
         let bytes = cmd.as_bytes();
@@ -170,9 +198,8 @@ impl PtyPair {
         
         match success {
             Ok(_) => {
-
+                // we can return a serde value from there
                 debug!("data correctly written: {:?} bytes written: {}", str::from_utf8(bytes).unwrap(), bytes_written);
-
             }
             Err(e) => {
                 error!("Failed to write to stdin: {:?}", e);
@@ -197,13 +224,13 @@ impl PtyPair {
         let master = Master { read: Arc::new(Mutex::new(stdout_read)), write: Arc::new(Mutex::new(stdin_write)) };
         let slave = Slave { read: stdin_read, write: stdout_write };
 
-        let process_info  = Self::start_main_process(master.clone(), Self::allocate_startup_info(&hpc).unwrap());
+        let (process_info, handle_job)  = Self::start_main_process(master.clone(), Self::allocate_startup_info(&hpc).unwrap());
 
          unsafe {
             let _ = CloseHandle(stdout_write); 
         }
 
-        let pair = PtyPair { master: master.clone(), slave: slave.clone(), hpc, process_info };
+        let pair = PtyPair { master: master.clone(), slave: slave.clone(), hpc, process_info, h_job: handle_job };
         Ok(pair)
 
     }
@@ -285,15 +312,49 @@ impl PtyPair {
         
     }
 
-    fn start_subprocess(master: Master, si: STARTUPINFOEXW) -> io::Result<PROCESS_INFORMATION> {
-        let process_info = Self::start_main_process(master, si);
-        if process_info.hProcess.is_invalid() {
-            return Err(io::Error::new(io::ErrorKind::Other, "Failed to start subprocess"));
+    fn get_subprocess_pid(&self) -> u32 {
+        let pids = Self::get_job_process_list(self.h_job);
+        let parent_pid = self.process_info.dwProcessId;
+
+        // Filter out the parent PID (powershell.exe itself)
+        for pid in pids {
+            if pid != parent_pid {
+                println!("Subprocess in job: PID = {}", pid);
+                return pid;
+            }
         }
-        Ok(process_info)
+
+        0
     }
 
-    fn start_main_process(master: Master, si: STARTUPINFOEXW) -> PROCESS_INFORMATION {
+    // this is what wrapping our process in an Object allows us to do (nice grouping I like it miam)
+    fn get_job_process_list(h_job: HANDLE) -> Vec<u32> {
+        let size = std::mem::size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() + std::mem::size_of::<usize>() * 16;
+        let mut buffer = vec![0u8; size];
+
+        unsafe {
+            let result = QueryInformationJobObject(
+                Some(h_job),
+                JobObjectBasicProcessIdList,
+                buffer.as_mut_ptr() as *mut _,
+                size as u32,
+                Some(null_mut()),
+            );
+
+            if !result.is_ok() {
+                error!("Failed to query job object info: {:?}", GetLastError());
+                return vec![];
+            }
+
+            let list: &JOBOBJECT_BASIC_PROCESS_ID_LIST = &*(buffer.as_ptr() as *const _);
+            let count = list.NumberOfProcessIdsInList as usize;
+            let pids_ptr = list.ProcessIdList.as_ptr();
+            let pids = std::slice::from_raw_parts(pids_ptr as *const usize, count);
+            return pids.iter().map(|pid| *pid as u32).collect();
+        }
+    }
+
+    fn start_main_process(master: Master, si: STARTUPINFOEXW) -> (PROCESS_INFORMATION, HANDLE) {
        let mut cmdline: Vec<u16> = "powershell.exe -NoExit -NoLogo -NoProfile"
         .encode_utf16()
         .chain(std::iter::once(0)) // null-terminated for Windows API
@@ -310,7 +371,7 @@ impl PtyPair {
                 Some(PWSTR(cmdline.as_mut_ptr())),
                 None,
                 None,
-                FALSE.as_bool(),
+                TRUE.as_bool(),
                 EXTENDED_STARTUPINFO_PRESENT | CREATE_NEW_PROCESS_GROUP,
                 None,
                 None,
@@ -319,12 +380,22 @@ impl PtyPair {
             )
         };
 
+        // Adding our powershell to a JobObject allows us to get child processes "more easily"
+        let h_job = unsafe { CreateJobObjectW(None, None) }.unwrap_or_else(|e| {
+            error!("Failed to create job object: {:?}", e);
+            panic!("Failed to create job object");
+        });
+
+        unsafe {
+            AssignProcessToJobObject(h_job, process_info.hProcess).unwrap();
+        }
 
         match success {
             Ok(_) => {
                 info!("Process created successfully.");
 
 
+                        // spawning the reading thread in another thread
                         let master_for_thread = master.clone();
                         std::thread::sleep(std::time::Duration::from_millis(1000)); // allow time for initialization
 
@@ -337,33 +408,17 @@ impl PtyPair {
                             }
                     });
 
+                // unsafe {
+                //         WaitForSingleObject(process_info.hProcess, INFINITE);
+                //         // let mut exit_code = 0;
+                //         // let _ = GetExitCodeProcess(process_info.hProcess, &mut exit_code);
+                //         // debug!("Child process exit code: {}", exit_code);
 
-                // maybe it has to be uncommented
-
-                thread::spawn(move || {
-                    loop {
-                        let mut input = String::new();
-                        if io::stdin().read_line(&mut input).is_err() {
-                            error!("Failed to read from stdin");
-                            break;
-                        }
-                        if input.trim().is_empty() {
-                            continue;
-                        }
-                        Self::master_stdin(&master, &input, process_info.dwProcessId);
-                    }
-                });
-                unsafe {
-                        WaitForSingleObject(process_info.hProcess, INFINITE);
-                        // let mut exit_code = 0;
-                        // let _ = GetExitCodeProcess(process_info.hProcess, &mut exit_code);
-                        // debug!("Child process exit code: {}", exit_code);
-
-                        // if exit_code != 0 {
-                        //     let error_code = GetLastError();
-                        //     error!("Process failed with exit code: {}, Error Code: {:?}", exit_code, error_code);
-                        // }
-                    }; 
+                //         // if exit_code != 0 {
+                //         //     let error_code = GetLastError();
+                //         //     error!("Process failed with exit code: {}, Error Code: {:?}", exit_code, error_code);
+                //         // }
+                //     }; 
             }
 
 
@@ -378,7 +433,7 @@ impl PtyPair {
             let _ = HeapFree(GetProcessHeap().unwrap(), windows::Win32::System::Memory::HEAP_FLAGS(0), Some(si.lpAttributeList.0 as *const c_void));
         }
 
-        return process_info
+        return (process_info, h_job);
     }
     
     fn resize_pseudo_console(self: Self, size: COORD) {
@@ -390,7 +445,6 @@ impl PtyPair {
         }
     }
 
-    // unused by useful for debuggin
     fn collect_os_vars() -> Option<*const c_void> {
 
 
@@ -478,6 +532,38 @@ impl PtyPair {
 
 }
 
-fn main() {
-        PtyPair::new();
+use once_cell::sync::Lazy;
+static PTY: Lazy<Mutex<Option<PtyPair>>> = Lazy::new(|| Mutex::new(None));
+type AppResult<T> = std::result::Result<T, String>;
+
+#[tauri::command]
+fn start_terminal() -> AppResult<String> {
+    let mut pty_guard = PTY.lock().unwrap();
+    if pty_guard.is_none() {
+        *pty_guard = Some(PtyPair::new());
+        println!("PTY initialized");
+    }
+    Ok("Terminal started".to_string())
+}
+
+#[tauri::command]
+fn send_pty_cmd(cmd: &str) -> AppResult<String> {
+
+    println!("Sending command: {}", cmd);
+    let pty_guard = PTY.lock().unwrap();
+    if let Some(ref pty) = *pty_guard {
+        pty.write(cmd);
+        Ok("Command sent".to_string())
+    } else {
+        Err("PTY not initialized".to_string())
+    }
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .invoke_handler(tauri::generate_handler![start_terminal, send_pty_cmd])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
 }
